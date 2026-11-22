@@ -1,0 +1,241 @@
+--- konsole-original/src/Screen.cpp	2026-11-22 21:14:36.000000000 +0300
++++ konsole-work/src/Screen.cpp	2026-11-22 21:41:17.353003052 +0300
+@@ -1289,7 +1289,10 @@
+         auto i = _graphicsPlacements.begin();
+         while (i != _graphicsPlacements.end()) {
+             TerminalGraphicsPlacement_t *p = i->get();
+-            if (p->source != TerminalGraphicsPlacement_t::Kitty
++            // Animated iTerm2 images behave like graphics placements, not
++            // mutable ANSI text: keep their frames anchored while output
++            // beside them arrives. Their lifetime still follows scrollback.
++            if (p->source != TerminalGraphicsPlacement_t::Kitty && !p->animation
+                 && p->row == _cuY
+                 && _cuX >= p->col
+                 && _cuX < p->col + p->cols) {
+@@ -1575,7 +1578,7 @@
+         while (i != _graphicsPlacements.end()) {
+             TerminalGraphicsPlacement_t *p = i->get();
+             const int startCol = loca % _columns;
+-            if (p->source != TerminalGraphicsPlacement_t::Kitty
++            if (p->source != TerminalGraphicsPlacement_t::Kitty && !p->animation
+                 && p->row <= bottomLine && p->row + p->rows > topLine
+                 && p->col < _columns && p->col + p->cols > 0
+                 && (p->row > topLine || p->col + p->cols > startCol)) {
+@@ -2624,7 +2627,8 @@
+                           int pid,
+                           qreal opacity,
+                           int X,
+-                          int Y)
++                          int Y,
++                          std::shared_ptr<TerminalAnimatedImage> animation)
+ {
+     if (pixmap.isNull()) {
+         return;
+@@ -2646,6 +2650,7 @@
+     }
+ 
+     p->pixmap = pixmap;
++    p->animation = std::move(animation);
+     p->z = z;
+     p->row = row;
+     p->col = col;
+--- konsole-original/src/Screen.h	2026-11-22 21:14:36.000000000 +0300
++++ konsole-work/src/Screen.h	2026-11-22 21:24:01.623054236 +0300
+@@ -10,9 +10,12 @@
+ 
+ // STD
+ #include <memory>
++#include <utility>
+ 
+ // Qt
+ #include <QBitArray>
++#include <QBuffer>
++#include <QMovie>
+ #include <QPointer>
+ #include <QRect>
+ #include <QSet>
+@@ -38,8 +41,25 @@
+ #define REPL_INPUT 2
+ #define REPL_OUTPUT 3
+ 
++// Retain the encoded GIF and its decoder for as long as its placement exists.
++// Member order ensures the movie is destroyed before the backing buffer.
++struct TerminalAnimatedImage {
++    explicit TerminalAnimatedImage(QByteArray bytes)
++        : data(std::move(bytes))
++        , buffer(&data)
++        , movie(&buffer, QByteArrayLiteral("gif"))
++    {
++        buffer.open(QIODevice::ReadOnly);
++    }
++
++    QByteArray data;
++    QBuffer buffer;
++    QMovie movie;
++};
++
+ struct TerminalGraphicsPlacement_t {
+     QPixmap pixmap;
++    std::shared_ptr<TerminalAnimatedImage> animation;
+     qint64 id;
+     qint64 pid;
+     int z, X, Y, col, row, cols, rows;
+@@ -698,7 +718,8 @@
+                       int pid = -1,
+                       qreal opacity = 1.0,
+                       int X = 0,
+-                      int Y = 0);
++                      int Y = 0,
++                      std::shared_ptr<TerminalAnimatedImage> animation = {});
+     TerminalGraphicsPlacement_t *getGraphicsPlacement(unsigned int i);
+     void delPlacements(int = 'a', qint64 = 0, qint64 = -1, int = 0, int = 0, int = 0);
+ 
+--- konsole-original/src/Vt102Emulation.cpp	2026-11-22 21:14:36.000000000 +0300
++++ konsole-work/src/Vt102Emulation.cpp	2026-11-22 22:00:13.820124993 +0300
+@@ -1755,11 +1755,26 @@
+             return;
+         }
+         QPixmap pixmap;
++        // The normal iTerm2 path only decodes the first GIF frame.
++        // Preserve the original bytes for a terminal-owned QMovie instead.
++        std::shared_ptr<TerminalAnimatedImage> animation;
++        if (tokenData.size() <= 8 * 1024 * 1024
++            && (tokenData.startsWith("GIF87a") || tokenData.startsWith("GIF89a"))) {
++            animation = std::make_shared<TerminalAnimatedImage>(tokenData);
++            // Some Qt GIF readers report -1 until frames have been decoded.
++            if (!animation->movie.isValid() || animation->movie.frameCount() == 1) {
++                animation.reset();
++            }
++        }
+         pixmap.loadFromData(tokenData);
+         tokenData.clear();
+         if (pixmap.isNull()) {
+             return;
+         }
++        // Bound the decoded frame surface; unusually large GIFs remain static.
++        if (animation && (pixmap.width() > 4096 || pixmap.height() > 4096)) {
++            animation.reset();
++        }
+         if (scaledWidth && scaledHeight) {
+             pixmap = pixmap.scaled(scaledWidth, scaledHeight, (Qt::AspectRatioMode)keepAspect);
+         } else {
+@@ -1770,7 +1785,83 @@
+             }
+         }
+         int rows = -1, cols = -1;
+-        _currentScreen->addPlacement(pixmap, rows, cols, -1, -1, TerminalGraphicsPlacement_t::iTerm, true, moveCursor);
++        if (animation) {
++            // Let Qt decode at the final placement size, not full GIF resolution.
++            animation->movie.setScaledSize(pixmap.size());
++            // Cache frames when the decoded animation is reasonably small.
++            const int frames = animation->movie.frameCount();
++            const qint64 estimatedBytes = qint64(pixmap.width()) * pixmap.height() * 4 * frames;
++            if (frames > 1 && estimatedBytes > 0 && estimatedBytes <= 24 * 1024 * 1024) {
++                animation->movie.setCacheMode(QMovie::CacheAll);
++            }
++        }
++        _currentScreen->addPlacement(pixmap, rows, cols, -1, -1, TerminalGraphicsPlacement_t::iTerm, true, moveCursor,
++                                     false, -1000, -1, -1, 1.0, 0, 0, animation);
++        if (animation) {
++            auto *display = _currentScreen->currentTerminalDisplay();
++            auto *animatedImage = animation.get();
++            auto *movie = &animation->movie;
++            QPointer<TerminalDisplay> safeDisplay(display);
++            auto updateAnimation = [safeDisplay, animatedImage, movie](bool repaint) {
++                auto *display = safeDisplay.data();
++                if (!display) {
++                    return;
++                }
++                auto window = display->screenWindow();
++                if (!window) {
++                    return;
++                }
++                auto *screen = window->screen();
++                if (!screen) {
++                    return;
++                }
++                // Find the current placement on every frame: its row changes
++                // with scrolling, so an absolute rectangle would drift.
++                for (unsigned int i = 0; ; ++i) {
++                    auto *p = screen->getGraphicsPlacement(i);
++                    if (!p) {
++                        break;
++                    }
++                    if (p->animation.get() != animatedImage) {
++                        continue;
++                    }
++                    const auto *font = display->terminalFont();
++                    const QRect bounds = display->contentRect();
++                    const int scrollDelta = font->fontHeight() * (window->currentLine() - screen->getHistLines());
++                    QRect imageRect(bounds.left() + p->col * font->fontWidth() + p->X,
++                                    bounds.top() + p->row * font->fontHeight() + p->Y - scrollDelta,
++                                    p->pixmap.width(), p->pixmap.height());
++                    const QRect dirty = imageRect.adjusted(-1, -1, 1, 1).intersected(bounds);
++                    const bool visible = !dirty.isEmpty();
++                    if (!visible && movie->state() == QMovie::Running) {
++                        movie->setPaused(true);
++                    } else if (visible && movie->state() == QMovie::Paused) {
++                        movie->setPaused(false);
++                    }
++                    if (visible && repaint) {
++                        display->update(dirty);
++                    }
++                    break;
++                }
++            };
++            QObject::connect(movie, &QMovie::frameChanged, display, [updateAnimation](int) {
++                updateAnimation(true);
++            });
++            // When paused, frameChanged cannot fire. Watch scrollback/output
++            // changes to resume as soon as the GIF becomes visible again.
++            if (auto window = display->screenWindow()) {
++                QObject::connect(window.data(), &ScreenWindow::scrolled, movie, [updateAnimation](int) {
++                    updateAnimation(false);
++                });
++                QObject::connect(window.data(), &ScreenWindow::outputChanged, movie, [updateAnimation]() {
++                    updateAnimation(false);
++                });
++            }
++            QObject::connect(&animation->movie, &QMovie::finished, &animation->movie, [&movie = animation->movie]() {
++                QTimer::singleShot(0, &movie, &QMovie::start);
++            });
++            animation->movie.start();
++        }
+     }
+ 
+     if (attribute == PointerShape) {
+--- konsole-original/src/terminalDisplay/TerminalPainter.cpp	2026-11-22 21:14:36.000000000 +0300
++++ konsole-work/src/terminalDisplay/TerminalPainter.cpp	2026-11-22 21:23:50.714907607 +0300
+@@ -1088,10 +1088,13 @@
+             }
+             int x = p->col * fontWidth + p->X + m_parentDisplay->contentRect().left();
+             int y = p->row * fontHeight + p->Y + m_parentDisplay->contentRect().top();
+-            QRectF srcRect(0, 0, p->pixmap.width(), p->pixmap.height());
++            const QPixmap frame = p->animation ? p->animation->movie.currentPixmap() : p->pixmap;
++            QRectF srcRect(0, 0, frame.width(), frame.height());
+             QRectF dstRect(x, y - scrollDelta, p->pixmap.width(), p->pixmap.height());
+             painter.setOpacity(p->opacity);
+-            painter.drawPixmap(dstRect, p->pixmap, srcRect);
++            if (!frame.isNull()) {
++                painter.drawPixmap(dstRect, frame, srcRect);
++            }
+             if (p->source == TerminalGraphicsPlacement_t::Sixel) {
+                 sixelRegion = sixelRegion.united(QRect(p->col, p->row, p->cols, p->rows));
+             }
+@@ -1120,11 +1123,14 @@
+             if (!p) {
+                 break;
+             }
+-            QPixmap image = p->pixmap;
++            QPixmap image = p->animation ? p->animation->movie.currentPixmap() : p->pixmap;
++            if (image.isNull()) {
++                image = p->pixmap;
++            }
+             int x = p->col * fontWidth + p->X + m_parentDisplay->contentRect().left();
+             int y = p->row * fontHeight + p->Y + m_parentDisplay->contentRect().top();
+             QRectF srcRect(0, 0, image.width(), image.height());
+-            QRectF dstRect(x, y - scrollDelta, image.width(), image.height());
++            QRectF dstRect(x, y - scrollDelta, p->pixmap.width(), p->pixmap.height());
+             painter.setOpacity(p->opacity);
+             painter.drawPixmap(dstRect, image, srcRect);
+             placementIdx++;
